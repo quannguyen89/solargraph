@@ -31,6 +31,7 @@ module Solargraph
         end
       }
       yardocs.push File.join(Dir.home, '.solargraph', 'cache', '2.0.0', 'yardoc')
+      yardocs.push File.join(Dir.home, '.solargraph', 'cache', '2.0.0', 'yardoc-stdlib')
       yardocs.uniq!
       cache_core
     end
