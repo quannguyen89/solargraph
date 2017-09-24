@@ -13,6 +13,7 @@ module Solargraph
       unless workspace.nil?
         wsy = File.join(workspace, '.yardoc')
         yardocs.push wsy if File.exist?(wsy)
+        add_gemfile
       end
       used = []
       required.each { |r|
@@ -294,6 +295,18 @@ module Solargraph
         'Module'
       else
         nil
+      end
+    end
+
+    def add_gemfile
+      path = File.join(workspace, 'Gemfile.lock')
+      if File.file?(path)
+        require 'bundler'
+        specs = Bundler::LockfileParser.new(File.read(path)).specs
+        specs.each do |dep|
+          gy = YARD::Registry.yardoc_file_for_gem(dep.name)
+          yardocs.push gy unless gy.nil?
+        end
       end
     end
   end
