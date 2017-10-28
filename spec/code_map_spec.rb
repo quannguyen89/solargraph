@@ -66,7 +66,7 @@ describe Solargraph::CodeMap do
     expect(node.type).to eq(:class)
   end
 
-  it "detects class variables" do
+  it "detects class instance variables" do
     code_map = Solargraph::CodeMap.new(code: %(
       class Foo
         @cvar = ''
@@ -114,28 +114,6 @@ describe Solargraph::CodeMap do
     code_map = Solargraph::CodeMap.new(code: "'string'.")
     result = code_map.suggest_at(9)
     expect(result.map(&:to_s)).to include('upcase')
-  end
-
-  it "stubs unfinished instance variables" do
-    code_map = Solargraph::CodeMap.new(code: "puts @")
-    expect(code_map.parsed).to eq("puts _")
-  end
-
-  it "stubs unfinished symbols" do
-    code_map = Solargraph::CodeMap.new(code: "symbol :")
-    expect(code_map.parsed).to eq("symbol _")
-  end
-
-  it "adds missing end keyword" do
-    code_map = Solargraph::CodeMap.new(code: "if true\nString.\nend")
-    expect(code_map.parsed).to eq("if true\nString.\nend;end")
-  end
-
-  it "stubs extra end keyword" do
-    code_map = Solargraph::CodeMap.new(code: "if true\nend\nend")
-    # @hack CodeMap tries to add an end on the first pass. Thus, the result
-    # of the parse has "#nd;end" instead of "#nd"
-    expect(code_map.parsed).to eq("if true\nend\n#nd;end")
   end
 
   it "resolves signatures to documentation" do
@@ -252,12 +230,14 @@ describe Solargraph::CodeMap do
       class Foo
         # @param baz [String]
         def bar baz
-          baz
+          baz.split(',').
         end
       end
-    ))
-    sig = code_map.infer_signature_at(80)
+    ), cursor: [4, 25])
+    sig = code_map.infer_signature_at(code_map.get_offset(4, 13))
     expect(sig).to eq('String')
+    sig = code_map.infer_signature_at(code_map.get_offset(4, 25))
+    expect(sig).to eq('Array')
   end
 
   it "infers signatures from yield params" do
@@ -446,7 +426,7 @@ describe Solargraph::CodeMap do
       foo = Foo.new
       foo.bar.
     ))
-    sugg = code_map.suggest_at(124)
+    sugg = code_map.suggest_at(code_map.get_offset(7, 14))
     expect(sugg.length).to eq(0)
   end
 
@@ -461,5 +441,79 @@ describe Solargraph::CodeMap do
     ))
     sugg = code_map.suggest_at(89)
     expect(sugg.length).to eq(0)
+  end
+
+  it "infers a method's return type from a tag" do
+    code_map = Solargraph::CodeMap.new(code: %(
+      class Foo
+        # @return [Hash]
+        def bar
+        end
+      end
+      foo = Foo.new
+      foo.bar
+    ))
+    sugg = code_map.resolve_object_at(code_map.get_offset(7, 12))
+    expect(sugg[0].return_type).to eq('Hash')
+  end
+
+  it "infer's a method's suggestion from its path" do
+    code_map = Solargraph::CodeMap.new(code: %(
+      my_hash = {}
+      my_hash.length
+    ))
+    sugg = code_map.resolve_object_at(code_map.get_offset(2, 18))
+    expect(sugg[0].label).to eq('length')
+  end
+
+  it "infers a local class" do
+    code_map = Solargraph::CodeMap.new(code: %(
+      class Foo;end
+      Foo
+    ))
+    sugg = code_map.resolve_object_at(code_map.get_offset(2, 8))
+    expect(sugg[0].label).to eq('Foo')
+  end
+
+  it "suggests symbols" do
+    code_map = Solargraph::CodeMap.new(code: %(
+      [:foo, :bar]
+      :f
+    ))
+    sugg = code_map.suggest_at(code_map.get_offset(2, 8)).map(&:to_s)
+    expect(sugg).to include(':foo')
+    expect(sugg).to include(':bar')
+  end
+
+  it "finds local variables in scope" do
+    code_map = Solargraph::CodeMap.new(code: %(
+      class Foo
+        def bar
+          lvar = 'lvar'
+          lvar
+        end
+        def baz
+          lvar
+        end
+      end
+      lvar
+    ))
+    sugg = code_map.suggest_at(code_map.get_offset(4, 13)).map(&:to_s)
+    expect(sugg).to include('lvar')
+    sugg = code_map.suggest_at(code_map.get_offset(7, 13)).map(&:to_s)
+    expect(sugg).not_to include('lvar')
+    sugg = code_map.suggest_at(code_map.get_offset(10, 9)).map(&:to_s)
+    expect(sugg).not_to include('lvar')
+  end
+
+  it "returns global variable suggestions" do
+    code_map = Solargraph::CodeMap.new(code: %(
+      $foo = 'foo'
+      $bar = 'bar'
+      $
+    ), cursor: [3, 7])
+    sugg = code_map.suggest_at(code_map.get_offset(3, 7)).map(&:to_s)
+    expect(sugg).to include('$foo')
+    expect(sugg).to include('$bar')
   end
 end

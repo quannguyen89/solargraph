@@ -5,15 +5,10 @@ require 'thread'
 module Solargraph
   class ApiMap
     autoload :Config,    'solargraph/api_map/config'
+    autoload :Source,    'solargraph/api_map/source'
     autoload :Cache,     'solargraph/api_map/cache'
-    autoload :MethodPin, 'solargraph/api_map/method_pin'
-    autoload :AttrPin,   'solargraph/api_map/attr_pin'
-    autoload :IvarPin,   'solargraph/api_map/ivar_pin'
-    autoload :CvarPin,   'solargraph/api_map/cvar_pin'
-    autoload :SymbolPin, 'solargraph/api_map/symbol_pin'
 
-    @@yard_map_cache = {}
-    @@semaphore = Mutex.new
+    @@source_cache = {}
 
     KEYWORDS = [
       '__ENCODING__', '__LINE__', '__FILE__', 'BEGIN', 'END', 'alias', 'and',
@@ -21,17 +16,6 @@ module Solargraph
       'elsif', 'end', 'ensure', 'false', 'for', 'if', 'in', 'module', 'next',
       'nil', 'not', 'or', 'redo', 'rescue', 'retry', 'return', 'self', 'super',
       'then', 'true', 'undef', 'unless', 'until', 'when', 'while', 'yield'
-    ].freeze
-
-    MAPPABLE_NODES = [
-      :array, :hash, :str, :dstr, :int, :float, :sym, :block, :class, :sclass,
-      :module, :def, :defs, :ivasgn, :gvasgn, :lvasgn, :cvasgn, :casgn,
-      :or_asgn, :const, :lvar, :args, :kwargs
-    ].freeze
-
-    MAPPABLE_METHODS = [
-      :include, :extend, :require, :autoload, :attr_reader, :attr_writer,
-      :attr_accessor, :private, :public, :protected
     ].freeze
 
     METHODS_RETURNING_SELF = [
@@ -54,60 +38,44 @@ module Solargraph
     def initialize workspace = nil
       @workspace = workspace.gsub(/\\/, '/') unless workspace.nil?
       clear
+      @workspace_files = []
       unless @workspace.nil?
         config = ApiMap::Config.new(@workspace)
-        config.included.each { |f|
-          unless config.excluded.include?(f)
-            append_file f
+        @workspace_files.concat (config.included - config.excluded)
+        @workspace_files.each do |wf|
+          begin
+            @@source_cache[wf] ||= Source.load(wf)
+          rescue
+            STDERR.puts "Failed to load #{wf}"
           end
-        }
+        end
       end
+      @sources = {}
+      @virtual_source = nil
+      @virtual_filename = nil
+      @stale = true
+      refresh
     end
 
     # @return [Solargraph::YardMap]
     def yard_map
-      @@semaphore.synchronize {
-        @yard_map ||= @@yard_map_cache[[required, workspace]] || Solargraph::YardMap.new(required: required, workspace: workspace)
-        @@yard_map_cache[[required, workspace]] ||= @yard_map
-      }
-    end
-
-    # Add a file to the map.
-    #
-    # @param filename [String]
-    # @return [AST::Node]
-    def append_file filename
-      append_source File.read(filename), filename
-    end
-
-    # Add a string of source code to the map.
-    #
-    # @param text [String]
-    # @param filename [String]
-    # @return [AST::Node]
-    def append_source text, filename = nil
-      @file_source[filename] = text
-      begin
-        node, comments = Parser::CurrentRuby.parse_with_comments(text)
-        append_node(node, comments, filename)
-      rescue Parser::SyntaxError => e
-        STDERR.puts "Error parsing '#{filename}': #{e.message}"
-        nil
+      refresh
+      if @yard_map.nil? || @yard_map.required != required
+        @yard_map = Solargraph::YardMap.new(required: required, workspace: workspace)
       end
+      @yard_map
     end
 
-    # Add an AST node to the map.
-    #
-    # @return [AST::Node]
-    def append_node node, comments, filename = nil
-      @stale = true
-      @file_comments[filename] = associate_comments(node, comments)
-      mapified = reduce(node, @file_comments[filename])
-      root = AST::Node.new(:begin, [filename])
-      root = root.append mapified
-      @file_nodes[filename] = root
-      @required.uniq!
-      root
+    def virtualize filename, code, cursor = nil
+      refresh
+      @virtual_filename = filename
+      @virtual_source = Source.fix(filename, code, cursor)
+      process_virtual
+      @virtual_source
+    end
+
+    def append_source code, filename
+      virtualize filename, code
     end
 
     def refresh force = false
@@ -120,13 +88,13 @@ module Solargraph
     # @return [YARD::Docstring]
     def get_comment_for node
       filename = get_filename_for(node)
-      return nil if @file_comments[filename].nil?
-      @file_comments[filename][node.loc]
+      return nil if @sources[filename].nil?
+      @sources[filename].docstring_for(node)
     end
 
     # @return [Array<Solargraph::Suggestion>]
     def self.get_keywords
-      @keyword_suggestions ||= (KEYWORDS + MAPPABLE_METHODS).map{ |s|
+      @keyword_suggestions ||= KEYWORDS.map{ |s|
         Suggestion.new(s.to_s, kind: Suggestion::KEYWORD, detail: 'Keyword')
       }.freeze
     end
@@ -145,14 +113,24 @@ module Solargraph
       result = []
       result += inner_namespaces_in(name, root, [])
       result += yard_map.get_constants name, root
-      fqns = find_fully_qualified_namespace(name, root)
-      unless fqns.nil?
-        nodes = get_namespace_nodes(fqns)
-        get_include_strings_from(*nodes).each { |i|
-          result += yard_map.get_constants(i, root)
-        }
-      end
       result
+    end
+
+    def get_constant_pins namespace, root
+      fqns = find_fully_qualified_namespace(namespace, root)
+      @const_pins[fqns] || []
+    end
+
+    def get_constants namespace, root
+      result = []
+      fqns = find_fully_qualified_namespace(namespace, root)
+      cp = @const_pins[fqns]
+      unless cp.nil?
+        cp.each do |pin|
+          result.push pin_to_suggestion(pin)
+        end
+      end
+      result.concat yard_map.get_constants(namespace, root)
     end
 
     def find_fully_qualified_namespace name, root = '', skip = []
@@ -168,7 +146,7 @@ module Solargraph
       else
         if (root == '')
           return name unless @namespace_map[name].nil?
-          get_include_strings_from(*@file_nodes.values).each { |i|
+          get_include_strings_from(*file_nodes).each { |i|
             reroot = "#{root == '' ? '' : root + '::'}#{i}"
             recname = find_fully_qualified_namespace name.to_s, reroot, skip
             return recname unless recname.nil?
@@ -181,7 +159,7 @@ module Solargraph
             roots.pop
           end
           return name unless @namespace_map[name].nil?
-          get_include_strings_from(*@file_nodes.values).each { |i|
+          get_include_strings_from(*file_nodes).each { |i|
             recname = find_fully_qualified_namespace name, i, skip
             return recname unless recname.nil?
           }
@@ -191,9 +169,14 @@ module Solargraph
     end
 
     def get_namespace_nodes(fqns)
-      return @file_nodes.values if fqns == '' or fqns.nil?
+      return file_nodes if fqns == '' or fqns.nil?
       refresh
       @namespace_map[fqns] || []
+    end
+
+    def get_instance_variable_pins(namespace, scope = :instance)
+      refresh
+      (@ivar_pins[namespace] || []).select{ |pin| pin.scope == scope }
     end
 
     def get_instance_variables(namespace, scope = :instance)
@@ -202,10 +185,15 @@ module Solargraph
       ip = @ivar_pins[namespace]
       unless ip.nil?
         ip.select{ |pin| pin.scope == scope }.each do |pin|
-          result.push pin.suggestion
+          result.push pin_to_suggestion(pin)
         end
       end
       result
+    end
+
+    def get_class_variable_pins(namespace)
+      refresh
+      @cvar_pins[namespace] || []
     end
 
     def get_class_variables(namespace)
@@ -214,7 +202,7 @@ module Solargraph
       ip = @cvar_pins[namespace]
       unless ip.nil?
         ip.each do |pin|
-          result.push pin.suggestion
+          result.push pin_to_suggestion(pin)
         end
       end
       result
@@ -222,44 +210,14 @@ module Solargraph
 
     def get_symbols
       refresh
-      result = []
-      @symbol_pins.each do |pin|
-        result.push pin.suggestion
-      end
-      result
-    end
-
-    def find_parent(node, *types)
-      parents = @parent_stack[node]
-      parents.each { |p|
-        return p if types.include?(p.type)
-      }
-      nil
-    end
-
-    def get_root_for(node)
-      s = @parent_stack[node]
-      return nil if s.nil?
-      return node if s.empty?
-      s.last
+      @symbol_pins.uniq(&:label)
     end
 
     def get_filename_for(node)
-      root = get_root_for(node)
-      root.nil? ? nil : root.children[0]
-    end
-
-    def yardoc_has_file?(file)
-      return false if workspace.nil?
-      if @yardoc_files.nil?
-        @yardoc_files = []
-        yard_options[:include].each { |glob|
-          Dir[File.join workspace, glob].each { |f|
-            @yardoc_files.push File.absolute_path(f)
-          }
-        }
+      @sources.each do |filename, source|
+        return source.filename if source.include?(node)
       end
-      @yardoc_files.include?(file)
+      nil
     end
 
     def infer_instance_variable(var, namespace, scope)
@@ -268,52 +226,27 @@ module Solargraph
       return nil if pins.nil?
       pin = pins.select{|p| p.name == var and p.scope == scope}.first
       return nil if pin.nil?
-      pin.suggestion.return_type
+      pin.return_type
     end
 
     def infer_class_variable(var, namespace)
-      result = nil
-      vn = nil
+      refresh
       fqns = find_fully_qualified_namespace(namespace)
-      unless fqns.nil?
-        get_namespace_nodes(fqns).each { |node|
-          vn = find_class_variable_assignment(var, node)
-          break unless vn.nil?
-        }
-      end
-      unless vn.nil?
-        cmnt = get_comment_for(vn)
-        unless cmnt.nil?
-          tag = cmnt.tag(:type)
-          result = tag.types[0] unless tag.nil? or tag.types.empty?
-        end
-        result = infer_literal_node_type(vn.children[1]) if result.nil?
-        if result.nil?
-          signature = resolve_node_signature(vn.children[1])
-          result = infer_signature_type(signature, namespace)
-        end
-      end
-      result
-    end
-
-    def find_class_variable_assignment(var, node)
-      node.children.each { |c|
-        next unless c.kind_of?(AST::Node)
-        if c.type == :cvasgn
-          if c.children[0].to_s == var
-            return c
-          end
-        else
-          inner = find_class_variable_assignment(var, c)
-          return inner unless inner.nil?
-        end
-      }
-      nil
+      pins = @cvar_pins[fqns]
+      return nil if pins.nil?
+      pin = pins.select{|p| p.name == var}.first
+      return nil if pin.nil?
+      pin.return_type
     end
 
     def get_global_variables
-      # TODO: Get them
-      []
+      result = []
+      @sources.values.each do |s|
+        s.global_variable_pins.each do |p|
+          result.push pin_to_suggestion(p)
+        end
+      end
+      result
     end
 
     def infer_assignment_node_type node, namespace
@@ -345,8 +278,9 @@ module Solargraph
     end
 
     def infer_signature_type signature, namespace, scope: :class
-      cached = cache.get_signature_type(signature, namespace, scope)
-      return cached unless cached.nil?
+      if cache.has_signature_type?(signature, namespace, scope)
+        return cache.get_signature_type(signature, namespace, scope)
+      end
       return nil if signature.nil? or signature.empty?
       result = nil
       if namespace.end_with?('#class')
@@ -404,19 +338,30 @@ module Solargraph
       refresh
       namespace = clean_namespace_string(namespace)
       meths = []
-      meths += inner_get_methods(namespace, root, []) #unless has_yardoc?
+      meths.concat inner_get_methods(namespace, root, []) #unless has_yardoc?
       yard_meths = yard_map.get_methods(namespace, root, visibility: visibility)
       if yard_meths.any?
         meths.concat yard_meths
       else
         type = get_namespace_type(namespace, root)
         if type == :class
-          meths += yard_map.get_instance_methods('Class')
+          meths.concat yard_map.get_instance_methods('Class')
         elsif type == :module
-          meths += yard_map.get_methods('Module')
+          meths.concat yard_map.get_methods('Module')
         end
-        meths
       end
+      news = meths.select{|s| s.label == 'new'}
+      unless news.empty?
+        fqns = find_fully_qualified_namespace(namespace, root)
+        if @method_pins[fqns]
+          inits = @method_pins[fqns].select{|p| p.name == 'initialize'}
+          meths -= news unless inits.empty?
+          inits.each do |pin|
+            meths.push Suggestion.new('new', kind: pin.kind, documentation: pin.docstring, detail: pin.namespace, arguments: pin.parameters, path: pin.path)
+          end
+        end
+      end
+      meths
     end
 
     # Get an array of instance methods that are available in the specified
@@ -446,27 +391,6 @@ module Solargraph
       meths
     end
 
-    def get_superclass(namespace, root = '')
-      fqns = find_fully_qualified_namespace(namespace, root)
-      nodes = get_namespace_nodes(fqns)
-      nodes.each { |n|
-        if n.kind_of?(AST::Node)
-          if n.type == :class and !n.children[1].nil?
-            return unpack_name(n.children[1])
-          end
-        end
-      }
-      return nil
-    end
-
-    def self.current
-      if @current.nil?
-        @current = ApiMap.new
-        @current.merge(Parser::CurrentRuby.parse(File.read("#{Solargraph::STUB_PATH}/ruby/2.3.0/core.rb")))
-      end
-      @current
-    end
-
     def get_include_strings_from *nodes
       arr = []
       nodes.each { |node|
@@ -479,42 +403,40 @@ module Solargraph
       arr
     end
 
-    def code_for node
-      src = @file_source[get_filename_for(node)]
-      return nil if src.nil?
-      b = node.location.expression.begin.begin_pos
-      e = node.location.expression.end.end_pos
-      src[b..e].strip.gsub(/,$/, '')
-    end  
+    def update filename
+      @@source_cache[filename] ||= Source.load(filename)
+      cache.clear
+    end
 
-    # Update the YARD documentation for the current workspace.
-    #
-    def update_yardoc
-      if workspace.nil?
-        STDERR.puts "No workspace specified for yardoc update."
+    def sources
+      @sources.values
+    end
+
+    def get_path_suggestions path
+      result = []
+      if path.include?('#')
+        # It's an instance method
+        parts = path.split('#')
+        result = get_instance_methods(parts[0], '', visibility: [:public, :private, :protected]).select{|s| s.label == parts[1]}
+      elsif path.include?('.')
+        # It's a class method
+        parts = path.split('.')
+        result = get_instance_methods(parts[0], '', visibility: [:public, :private, :protected]).select{|s| s.label == parts[1]}
       else
-        Dir.chdir(workspace) do
-          STDERR.puts "Updating the yardoc for #{workspace}..."
-          cmd = "yardoc -e #{Solargraph::YARD_EXTENSION_FILE}"
-          STDERR.puts "Update yardoc with #{cmd}"
-          STDERR.puts `#{cmd}`
-          unless $?.success?
-            STDERR.puts "There was an error processing the workspace yardoc."
-          end
+        # It's a class or module
+        get_namespace_nodes(path).each do |node|
+          # TODO This is way underimplemented
+          result.push Suggestion.new(path, kind: Suggestion::CLASS)
         end
-        @@semaphore.synchronize {
-          @@yard_map_cache.clear
-        }
-        end
+        result.concat yard_map.objects(path)
+      end
+      result
     end
 
     private
 
     def clear
       @stale = false
-      @file_source = {}
-      @file_nodes = {}
-      @file_comments = {}
       @parent_stack = {}
       @namespace_map = {}
       @namespace_tree = {}
@@ -522,53 +444,107 @@ module Solargraph
     end
 
     def process_maps
+      @sources.clear
+      @workspace_files.each do |f|
+        begin
+          @@source_cache[f] ||= Source.load(f)
+          @sources[f] = @@source_cache[f]
+        rescue
+          STDERR.puts "Failed to load #{f}"
+        end
+      end
       cache.clear
       @ivar_pins = {}
       @cvar_pins = {}
+      @const_pins = {}
       @method_pins = {}
       @symbol_pins = []
-      @attr_nodes = {}
+      @attr_pins = {}
       @namespace_includes = {}
       @superclasses = {}
       @parent_stack = {}
       @namespace_map = {}
       @namespace_tree = {}
-      @file_nodes.values.each { |f|
-        map_parents f
-        map_namespaces f
+      @required = []
+      @pin_suggestions = {}
+      unless @virtual_source.nil?
+        @sources[@virtual_filename] = @virtual_source
+      end
+      @sources.values.each do |s|
+        s.namespace_nodes.each_pair do |k, v|
+          @namespace_map[k] ||= []
+          @namespace_map[k].concat v
+          add_to_namespace_tree k.split('::')
+        end
+      end
+      @sources.values.each { |s|
+        map_source s
       }
+      @required.uniq!
       @stale = false
+    end
+
+    def process_virtual
+      unless @virtual_source.nil?
+        cache.clear
+        @sources[@virtual_filename] = @virtual_source
+        @sources.values.each do |s|
+          s.namespace_nodes.each_pair do |k, v|
+            @namespace_map[k] ||= []
+            @namespace_map[k].concat v
+            add_to_namespace_tree k.split('::')
+          end
+        end
+        [@ivar_pins.values, @cvar_pins.values, @const_pins.values, @method_pins.values, @attr_pins.values].each do |pinsets|
+          pinsets.each do |pins|
+            pins.delete_if{|pin| pin.filename == @virtual_filename}
+          end
+        end
+        #@symbol_pins.delete_if{|pin| pin.filename == @virtual_filename}
+        map_source @virtual_source
+      end
+    end
+
+    # @param [Solargraph::ApiMap::Source]
+    def map_source source
+      source.method_pins.each do |pin|
+        @method_pins[pin.namespace] ||= []
+        @method_pins[pin.namespace].push pin
+      end
+      source.attribute_pins.each do |pin|
+        @attr_pins[pin.namespace] ||= []
+        @attr_pins[pin.namespace].push pin
+      end
+      source.instance_variable_pins.each do |pin|
+        @ivar_pins[pin.namespace] ||= []
+        @ivar_pins[pin.namespace].push pin
+      end
+      source.class_variable_pins.each do |pin|
+        @cvar_pins[pin.namespace] ||= []
+        @cvar_pins[pin.namespace].push pin
+      end
+      source.constant_pins.each do |pin|
+        @const_pins[pin.namespace] ||= []
+        @const_pins[pin.namespace].push pin
+      end
+      source.symbol_pins.each do |pin|
+        @symbol_pins.push Suggestion.new(pin.name, kind: Suggestion::CONSTANT, return_type: 'Symbol')
+      end
+      source.namespace_includes.each_pair do |ns, i|
+        @namespace_includes[ns] ||= []
+        @namespace_includes[ns].concat(i).uniq!
+      end
+      source.superclasses.each_pair do |cls, sup|
+        @superclasses[cls] = sup
+      end
+      source.required.each do |r|
+        required.push r
+      end
     end
 
     # @return [Solargraph::ApiMap::Cache]
     def cache
       @cache ||= Cache.new
-    end
-
-    def associate_comments node, comments
-      comment_hash = Parser::Source::Comment.associate_locations(node, comments)
-      yard_hash = {}
-      comment_hash.each_pair { |k, v|
-        ctxt = ''
-        num = nil
-        started = false
-        v.each { |l|
-          # Trim the comment and minimum leading whitespace
-          p = l.text.gsub(/^#/, '')
-          if num.nil? and !p.strip.empty?
-            num = p.index(/[^ ]/)
-            started = true
-          elsif started and !p.strip.empty?
-            cur = p.index(/[^ ]/)
-            num = cur if cur < num
-          end
-          if started
-            ctxt += "#{p[num..-1]}\n"
-          end
-        }
-        yard_hash[k] = YARD::Docstring.parser.parse(ctxt).to_docstring
-      }
-      yard_hash
     end
 
     def inner_get_methods(namespace, root = '', skip = [])
@@ -580,7 +556,7 @@ module Solargraph
       mn = @method_pins[fqns]
       unless mn.nil?
         mn.select{ |pin| pin.scope == :class }.each do |pin|
-          meths.push pin.suggestion(self)
+          meths.push pin_to_suggestion(pin)
         end
       end
       meths.uniq
@@ -591,21 +567,24 @@ module Solargraph
       meths = []
       return meths if skip.include?(fqns)
       skip.push fqns
-      an = @attr_nodes[fqns]
+      an = @attr_pins[fqns]
       unless an.nil?
         an.each do |pin|
-          meths.concat pin.suggestions
+          meths.push pin_to_suggestion(pin)
         end
       end
       mn = @method_pins[fqns]
       unless mn.nil?
         mn.select{|pin| visibility.include?(pin.visibility) and pin.scope == :instance }.each do |pin|
-          meths.push pin.suggestion(self)
+          meths.push pin_to_suggestion(pin)
         end
       end
       if visibility.include?(:public) or visibility.include?(:protected)
         sc = @superclasses[fqns]
-        meths.concat inner_get_instance_methods(sc, fqns, skip, visibility - [:private]) unless sc.nil?
+        unless sc.nil?
+          meths.concat inner_get_instance_methods(sc, fqns, skip, visibility - [:private])
+          meths.concat yard_map.get_instance_methods(sc, fqns, visibility: visibility - [:private])
+        end
       end
       im = @namespace_includes[fqns]
       unless im.nil?
@@ -622,7 +601,6 @@ module Solargraph
       unless fqns.nil? or skip.include?(fqns)
         skip.push fqns
         nodes = get_namespace_nodes(fqns)
-        nodes.delete_if { |n| yardoc_has_file?(get_filename_for(n))}
         unless nodes.empty?
           cursor = @namespace_tree
           parts = fqns.split('::')
@@ -643,29 +621,18 @@ module Solargraph
               end
               result.push Suggestion.new(k, kind: kind, detail: detail)
             }
-            nodes = get_namespace_nodes(fqns)
-            nodes.each do |n|
-              result.concat get_constant_nodes(n, fqns)
-              get_include_strings_from(n).each { |i|
-                result += inner_namespaces_in(i, fqns, skip)
-              }
+            cp = @const_pins[fqns]
+            unless cp.nil?
+              cp.each do |pin|
+                result.push pin_to_suggestion(pin)
+              end
             end
-          end
-        end
-      end
-      result
-    end
-
-    def get_constant_nodes(node, fqns)
-      result = []
-      node.children.each do |n|
-        if n.kind_of?(AST::Node)
-          if n.type == :casgn
-            cmnt = get_comment_for(n)
-            type = infer_assignment_node_type(n, fqns)
-            result.push Suggestion.new(n.children[1].to_s, kind: Suggestion::CONSTANT, documentation: cmnt, return_type: type)
-          else
-            result.concat get_constant_nodes(n, fqns) unless n.type == :class or n.type == :module
+            inc = @namespace_includes[fqns]
+            unless inc.nil?
+              inc.each do |i|
+                result.concat inner_namespaces_in(i, fqns, skip)
+              end
+            end
           end
         end
       end
@@ -760,102 +727,6 @@ module Solargraph
       type
     end
 
-    def mappable?(node)
-      if node.kind_of?(AST::Node) and MAPPABLE_NODES.include?(node.type)
-        true
-      elsif node.kind_of?(AST::Node) and node.type == :send and node.children[0] == nil and MAPPABLE_METHODS.include?(node.children[1])
-        true
-      else
-        false
-      end
-    end
-
-    def reduce node, comment_hash
-      return node unless node.kind_of?(AST::Node)
-      mappable = get_mappable_nodes(node.children, comment_hash)
-      result = node.updated nil, mappable
-      result
-    end
-
-    def get_mappable_nodes arr, comment_hash
-      result = []
-      arr.each { |n|
-        if mappable?(n)
-          min = minify(n, comment_hash)
-          result.push min
-        else
-          next unless n.kind_of?(AST::Node)
-          result += get_mappable_nodes(n.children, comment_hash)
-        end
-      }
-      result
-    end
-
-    def minify node, comment_hash
-      return node if node.type == :args
-      type = node.type
-      children = []
-      if node.type == :class or node.type == :block or node.type == :sclass
-        children += node.children[0, 2]
-        children += get_mappable_nodes(node.children[2..-1], comment_hash)
-      elsif node.type == :const or node.type == :args or node.type == :kwargs
-        children += node.children
-      elsif node.type == :def
-        children += node.children[0, 2]
-        children += get_mappable_nodes(node.children[2..-1], comment_hash)
-      elsif node.type == :defs
-        children += node.children[0, 3]
-        children += get_mappable_nodes(node.children[3..-1], comment_hash)
-      elsif node.type == :module
-        children += node.children[0, 1]
-        children += get_mappable_nodes(node.children[1..-1], comment_hash)
-      elsif node.type == :ivasgn or node.type == :gvasgn or node.type == :lvasgn or node.type == :cvasgn or node.type == :casgn
-        children += node.children
-      elsif node.type == :send and node.children[1] == :include
-        children += node.children[0,3]
-      elsif node.type == :send and node.children[1] == :require
-        if node.children[2].children[0].kind_of?(String)
-          path = node.children[2].children[0].to_s
-          @required.push(path) unless local_path?(path)
-        end
-        children += node.children[0, 3]
-      elsif node.type == :send and node.children[1] == :autoload
-        @required.push(node.children[3].children[0]) if node.children[3].children[0].kind_of?(String)
-        type = :require
-        children += node.children[1, 3]
-      elsif node.type == :send or node.type == :lvar
-        children += node.children
-      elsif node.type == :or_asgn
-        # TODO: The api_map should ignore local variables.
-        type = node.children[0].type
-        children.push node.children[0].children[0], node.children[1]
-      elsif [:array, :hash, :str, :dstr, :int, :float].include?(node.type)
-        node.children.each do |c|
-          children.push minify(c, comment_hash) if mappable?(c)
-        end
-      elsif node.type == :sym
-        children.push node.children[0]
-      end
-      result = node.updated(type, children)
-      result
-    end
-
-    def local_path? path
-      return false if workspace.nil?
-      return true if File.exist?(File.join workspace, 'lib', path)
-      return true if File.exist?(File.join workspace, 'lib', "#{path}.rb")
-      false
-    end
-
-    def map_parents node, tree = []
-      if node.kind_of?(AST::Node)
-        @parent_stack[node] = tree
-        node.children.each { |c|
-          map_parents c, [node] + tree
-        }
-      end
-    end
-
     def add_to_namespace_tree tree
       cursor = @namespace_tree
       tree.each { |t|
@@ -864,71 +735,8 @@ module Solargraph
       }
     end
 
-    def map_namespaces node, tree = [], visibility = :public, scope = :instance, fqn = nil
-      if node.kind_of?(AST::Node)
-        return if node.type == :str or node.type == :dstr
-        if node.type == :class or node.type == :module
-          visibility = :public
-          if node.children[0].kind_of?(AST::Node) and node.children[0].children[0].kind_of?(AST::Node) and node.children[0].children[0].type == :cbase
-            tree = pack_name(node.children[0])
-          else
-            tree = tree + pack_name(node.children[0])
-          end
-          add_to_namespace_tree tree
-          fqn = tree.join('::')
-          @namespace_map[fqn] ||= []
-          @namespace_map[fqn].push node
-          if node.type == :class and !node.children[1].nil?
-            sc = unpack_name(node.children[1])
-            @superclasses[fqn] = sc
-          end
-        end
-        file = get_filename_for(node)
-        in_yardoc = yardoc_has_file?(file)
-        node.children.each do |c|
-          if c.kind_of?(AST::Node)
-            if c.type == :ivasgn
-              @ivar_pins[fqn || ''] ||= []
-              par = find_parent(c, :class, :module, :def, :defs)
-              local_scope = ( (par.kind_of?(AST::Node) and par.type == :def) ? :instance : :class )
-              @ivar_pins[fqn || ''].push IvarPin.new(self, c, fqn || '', local_scope, get_comment_for(c))
-            elsif c.type == :cvasgn
-              @cvar_pins[fqn] ||= []
-              @cvar_pins[fqn].push CvarPin.new(self, c, fqn, get_comment_for(c))
-            elsif c.type == :sym
-              @symbol_pins.push SymbolPin.new(c)
-            else
-              unless fqn.nil? or in_yardoc
-                if c.kind_of?(AST::Node)
-                  if c.type == :def and c.children[0].to_s[0].match(/[a-z]/i)
-                    @method_pins[fqn] ||= []
-                    @method_pins[fqn].push MethodPin.new(c, fqn, scope, visibility, get_comment_for(c))
-                    map_namespaces c, tree, visibility, scope, fqn
-                    next
-                  elsif c.type == :defs
-                    @method_pins[fqn] ||= []
-                    @method_pins[fqn].push MethodPin.new(c, fqn, :class, :public, get_comment_for(c))
-                    map_namespaces c, tree, :public, :class, fqn
-                    next
-                  elsif c.type == :send and [:public, :protected, :private].include?(c.children[1])
-                    visibility = c.children[1]
-                  elsif c.type == :send and c.children[1] == :include and node.type == :class
-                    @namespace_includes[fqn] ||= []
-                    @namespace_includes[fqn].push unpack_name(c.children[2])
-                  elsif c.type == :send and [:attr_reader, :attr_writer, :attr_accessor].include?(c.children[1])
-                    @attr_nodes[fqn] ||= []
-                    @attr_nodes[fqn].push AttrPin.new(c)
-                  elsif c.type == :sclass and c.children[0].type == :self
-                    map_namespaces c, tree, :public, :class, fqn
-                    next
-                  end
-                end
-              end
-              map_namespaces c, tree, visibility, scope, fqn
-            end
-          end
-        end
-      end
+    def file_nodes
+      @sources.values.map(&:node)
     end
 
     def clean_namespace_string namespace
@@ -939,5 +747,23 @@ module Solargraph
       end
       result
     end
+
+    # @param pin [Solargraph::Pin::Base]
+    # @return [Solargraph::Suggestion]
+    def pin_to_suggestion pin
+      #@pin_suggestions[pin] ||= Suggestion.pull(pin, resolve_pin_return_type(pin))
+      @pin_suggestions[pin] ||= Suggestion.pull(pin)
+    end
+
+    # @param pin [Solargraph::Pin::Base]
+    # @return [String]
+    def resolve_pin_return_type pin
+      return pin.return_type unless pin.return_type.nil?
+      return nil if pin.signature.nil?
+      # Avoid infinite loops from variable assignments that reference themselves
+      return nil if pin.name == pin.signature.split('.').first
+      infer_signature_type(pin.signature, pin.namespace)
+    end
+
   end
 end

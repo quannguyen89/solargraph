@@ -1,3 +1,5 @@
+require 'tmpdir'
+
 describe Solargraph::ApiMap do
   before :each do
     code = %(
@@ -327,6 +329,18 @@ describe Solargraph::ApiMap do
     expect(type).to eq('String')
   end
 
+  it "infers a class variable type in a nil guard" do
+    code = %(
+      class Foo
+        @@bar ||= ''
+      end
+    )
+    api_map = Solargraph::ApiMap.new
+    api_map.append_source(code, 'file.rb')
+    type = api_map.infer_signature_type('@@bar', 'Foo')
+    expect(type).to eq('String')
+  end
+
   it "infers a class method return type from a tag" do
     code = %(
       class Foo
@@ -438,5 +452,85 @@ describe Solargraph::ApiMap do
     expect(syms).to include(':Baz')
     expect(syms).to include(':bang')
     expect(syms).to include(':bong')
+  end
+
+  it "collects superclass methods" do
+    code = %(
+      class Foo
+        def foo_func
+        end
+      end
+      class Bar < Foo
+      end
+    )
+    api_map = Solargraph::ApiMap.new
+    api_map.append_source(code, 'file.rb')
+    meths = api_map.get_instance_methods('Bar')
+    expect(meths.map(&:to_s)).to include('foo_func')
+  end
+
+  it "collects superclass methods from yardocs" do
+    code = %(
+      class Foo < String
+      end
+    )
+    api_map = Solargraph::ApiMap.new
+    api_map.append_source(code, 'file.rb')
+    meths = api_map.get_instance_methods('Foo')
+    expect(meths.map(&:to_s)).to include('upcase')
+  end
+
+  it "includes params in suggestions" do
+    code = %(
+      class Foo
+        # @param baz [String]
+        def bar baz
+        end
+      end
+    )
+    api_map = Solargraph::ApiMap.new
+    api_map.append_source(code, 'file.rb')
+    meth = api_map.get_instance_methods('Foo').select{|s| s.label == 'bar'}.first
+    expect(meth.params).to eq(['baz [String]'])
+  end
+
+  it "includes restarg in suggestions" do
+    code = %(
+      class Foo
+        def bar *baz
+        end
+      end
+    )
+    api_map = Solargraph::ApiMap.new
+    api_map.append_source(code, 'file.rb')
+    # @type [Solargraph::Suggestion]
+    meth = api_map.get_instance_methods('Foo').select{|s| s.label == 'bar'}.first
+    expect(meth.arguments).to eq(['*baz'])
+  end
+
+  it "gets instance methods from modules" do
+    code = %(
+      module Foo
+        def bar
+        end
+      end
+    )
+    api_map = Solargraph::ApiMap.new
+    api_map.append_source(code, 'file.rb')
+    meths = api_map.get_instance_methods('Foo').map(&:to_s)
+    expect(meths).to include('bar')
+  end
+
+  it "detects attribute return types from tags" do
+    code = %(
+      class Foo
+        # @return [String]
+        attr_reader :bar
+      end
+    )
+    api_map = Solargraph::ApiMap.new
+    api_map.append_source(code, 'file.rb')
+    sugg = api_map.get_instance_methods('Foo').select{|s| s.label == 'bar'}.first
+    expect(sugg.return_type).to eq('String')
   end
 end

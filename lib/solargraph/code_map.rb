@@ -5,19 +5,13 @@ module Solargraph
 
     # The root node of the parsed code.
     #
-    # @return [AST::Node]
-    attr_accessor :node
+    # @return [Parser::AST::Node]
+    attr_reader :node
 
     # The source code being analyzed.
     #
     # @return [String]
     attr_reader :code
-
-    # The source code after modification to fix syntax errors during parsing.
-    # This string will match #code if no modifications were made.
-    #
-    # @return [String]
-    attr_reader :parsed
 
     # The filename for the source code.
     #
@@ -38,68 +32,18 @@ module Solargraph
       filename = filename.gsub(File::ALT_SEPARATOR, File::SEPARATOR) unless filename.nil? or File::ALT_SEPARATOR.nil?
       @filename = filename
       @api_map = api_map
-      @code = code.gsub(/\r/, '')
-      tries = 0
-      tmp = @code
-      cursor = CodeMap.get_offset(@code, cursor[0], cursor[1]) if cursor.kind_of?(Array)
-      fixed_cursor = false
-      begin
-        # HACK: The current file is parsed with a trailing underscore to fix
-        # incomplete trees resulting from short scripts (e.g., a lone variable
-        # assignment).
-        node, @comments = Parser::CurrentRuby.parse_with_comments(tmp + "\n_")
-        @node = self.api_map.append_node(node, @comments, filename)
-        @parsed = tmp
-        @code.freeze
-        @parsed.freeze
-      rescue Parser::SyntaxError => e
-        if tries < 10
-          tries += 1
-          if tries == 10 and e.message.include?('token $end')
-            tmp += "\nend"
-          else
-            if !fixed_cursor and !cursor.nil? and e.message.include?('token $end') and cursor >= 2
-              fixed_cursor = true
-              spot = cursor - 2
-              if tmp[cursor - 1] == '.'
-                repl = ';'
-              else
-                repl = '#'
-              end
-            else
-              spot = e.diagnostic.location.begin_pos
-              repl = '_'
-              if tmp[spot] == '@' or tmp[spot] == ':'
-                # Stub unfinished instance variables and symbols
-                spot -= 1
-              elsif tmp[spot - 1] == '.'
-                # Stub unfinished method calls
-                repl = '#' if spot == tmp.length or tmp[spot] == '\n'
-                spot -= 2
-              else
-                # Stub the whole line
-                spot = beginning_of_line_from(tmp, spot)
-                repl = '#'
-                if tmp[spot+1..-1].rstrip == 'end'
-                  repl= 'end;end'
-                end
-              end
-            end
-            tmp = tmp[0..spot] + repl + tmp[spot+repl.length+1..-1].to_s
-          end
-          retry
-        end
-        raise e
-      end
+      @source = self.api_map.virtualize filename, code, cursor
+      @node = @source.node
+      @code = @source.code
+      @comments = @source.comments
+      self.api_map.refresh
     end
 
-    # Get the ApiMap that was generated for this CodeMap.
+    # Get the associated ApiMap.
     #
     # @return [Solargraph::ApiMap]
     def api_map
       @api_map ||= ApiMap.new(workspace)
-      @api_map.refresh
-      @api_map
     end
 
     # Get the offset of the specified line and column.
@@ -121,7 +65,7 @@ module Solargraph
           offset += l.length
         }
       end
-      offset + col      
+      offset + col
     end
 
     # Get an array of nodes containing the specified index, starting with the
@@ -210,25 +154,6 @@ module Solargraph
       end
     end
 
-    # Select the phrase that directly precedes the specified index.
-    # A phrase can consist of most types of characters other than whitespace,
-    # semi-colons, equal signs, parentheses, or brackets.
-    #
-    # @param index [Integer]
-    # @return [String]
-    def phrase_at index
-      word = ''
-      cursor = index - 1
-      while cursor > -1
-        char = @code[cursor, 1]
-        break if char.nil? or char == ''
-        break unless char.match(/[\s;=\(\)\[\]\{\}]/).nil?
-        word = char + word
-        cursor -= 1
-      end
-      word
-    end
-
     # Select the word that directly precedes the specified index.
     # A word can only consist of letters, numbers, and underscores.
     #
@@ -240,6 +165,7 @@ module Solargraph
       while cursor > -1
         char = @code[cursor, 1]
         break if char.nil? or char == ''
+        word = char + word if char == '$'
         break unless char.match(/[a-z0-9_]/i)
         word = char + word
         cursor -= 1
@@ -257,14 +183,6 @@ module Solargraph
       node = parent_node_from(index, :def, :defs, :class, :module, :sclass)
       ns = namespace_at(index) || ''
       scope = (node.type == :def ? :instance : :class)
-      sclass = (node.type == :sclass ? node : api_map.find_parent(node, :sclass))
-      unless sclass.nil?
-        if node.type == :def
-          scope = :class
-        else
-          return []
-        end
-      end
       api_map.get_instance_variables(ns, scope)
     end
 
@@ -272,72 +190,58 @@ module Solargraph
     # source.
     #
     # @return [Array<Suggestions>] The completion suggestions
-    def suggest_at index, filtered: false, with_snippets: false
+    def suggest_at index, filtered: true, with_snippets: false
       return [] if string_at?(index) or string_at?(index - 1) or comment_at?(index)
-      result = []
       signature = get_signature_at(index)
-      if signature.start_with?(':')
-        result.concat api_map.get_symbols
-      else
-        if index == 0 or @code[index - 1].match(/[\.\s]/)
-          type = infer_signature_at(index)
-        else
-          if signature.include?('.')
-            last_period = @code[0..index].rindex('.')
-            if last_period.nil?
-              type = infer_signature_at(index)
-            else
-              type = infer_signature_at(last_period)
-            end  
+      unless signature.include?('.')
+        if signature.start_with?(':')
+          return api_map.get_symbols
+        elsif signature.start_with?('@@')
+          return get_class_variables_at(index)
+        elsif signature.start_with?('@')
+          return get_instance_variables_at(index)
+        elsif signature.start_with?('$')
+          return api_map.get_global_variables
+        end
+      end
+      result = []
+      type = nil
+      if signature.include?('.')
+        type = infer_signature_at(index)
+        if type.nil? and signature.include?('.')
+          last_period = @code[0..index].rindex('.')
+          type = infer_signature_at(last_period)
+        end
+      end
+      if type.nil?
+        unless signature.include?('.')
+          namespace = namespace_at(index)
+          if signature.include?('::')
+            parts = signature.split('::', -1)
+            ns = parts[0..-2].join('::')
+            result = api_map.namespaces_in(ns, namespace)
           else
-            if signature.start_with?('@@')
-              return get_class_variables_at(index)
-            elsif signature.start_with?('@')
-              return get_instance_variables_at(index)
-            elsif signature.start_with?('$')
-              return api_map.get_global_variables
+            type = infer_literal_node_type(node_at(index - 2))
+            if type.nil?
+              current_namespace = namespace_at(index)
+              parts = current_namespace.to_s.split('::')
+              result += get_snippets_at(index) if with_snippets
+              result += get_local_variables_and_methods_at(index)
+              result += ApiMap.get_keywords
+              while parts.length > 0
+                ns = parts.join('::')
+                result += api_map.namespaces_in(ns, namespace)
+                parts.pop
+              end
+              result += api_map.namespaces_in('')
+              result += api_map.get_instance_methods('Kernel')
             else
-              type = infer_signature_at(index)
+              result.concat api_map.get_instance_methods(type)
             end
           end
         end
-        if type.nil?
-          unless signature.include?('.')
-            phrase = phrase_at(index)
-            signature = get_signature_at(index)
-            namespace = namespace_at(index)
-            if phrase.include?('::')
-              parts = phrase.split('::', -1)
-              ns = parts[0..-2].join('::')
-              if parts.last.include?('.')
-                ns = parts[0..-2].join('::') + '::' + parts.last[0..parts.last.index('.')-1]
-                result = api_map.get_methods(ns)
-              else
-                result = api_map.namespaces_in(ns, namespace)
-              end
-            else
-              type = infer_literal_node_type(node_at(index - 2))
-              if type.nil?
-                current_namespace = namespace_at(index)
-                parts = current_namespace.to_s.split('::')
-                result += get_snippets_at(index) if with_snippets
-                result += get_local_variables_and_methods_at(index)
-                result += ApiMap.get_keywords
-                while parts.length > 0
-                  ns = parts.join('::')
-                  result += api_map.namespaces_in(ns, namespace)
-                  parts.pop
-                end
-                result += api_map.namespaces_in('')
-                result += api_map.get_instance_methods('Kernel')
-              else
-                result.concat api_map.get_instance_methods(type)
-              end
-            end
-          end
-        else
-          result.concat api_map.get_instance_methods(type)
-        end
+      else
+        result.concat api_map.get_instance_methods(type)
       end
       result = reduce_starting_with(result, word_at(index)) if filtered
       result.uniq{|s| s.path}.sort{|a,b| a.label <=> b.label}
@@ -347,7 +251,8 @@ module Solargraph
       sig = signature_index_before(index)
       return [] if sig.nil?
       word = word_at(sig)
-      suggest_at(sig).reject{|s| s.label != word}
+      sugg = suggest_at(sig - word.length)
+      sugg.select{|s| s.label == word}
     end
 
     def resolve_object_at index
@@ -385,7 +290,7 @@ module Solargraph
       if path.start_with?('Class<')
         path.gsub!(/^Class<([a-z0-9_:]*)>#([a-z0-9_]*)$/i, '\\1.\\2')
       end
-      api_map.yard_map.objects(path, ns_here)
+      api_map.get_path_suggestions(path)
     end
 
     # Infer the type of the signature located at the specified index.
@@ -422,6 +327,7 @@ module Solargraph
         node = parent_node_from(index, :class, :module, :def, :defs) || @node
         result = infer_signature_from_node signature, node
         if result.nil? or result.empty?
+          # The rest of this routine is dedicated to method and block parameters
           arg = nil
           if node.type == :def or node.type == :defs or node.type == :block
             # Check for method arguments
@@ -432,7 +338,7 @@ module Solargraph
               if parts[1].nil?
                 result = arg.return_type
               else
-                result = api_map.infer_signature_type(parts[1], parts[0], scope: :instance)
+                result = api_map.infer_signature_type(parts[1], arg.return_type, scope: :instance)
               end
             end
           end
@@ -507,16 +413,12 @@ module Solargraph
       return nil if start.nil?
       remainder = parts[1..-1]
       if start.start_with?('@@')
-        type = api_map.infer_class_variable(start, ns_here)
-        return nil if type.nil?
-        return type if remainder.empty?
-        return api_map.infer_signature_type(remainder.join('.'), type, scope: :instance)
+        cv = api_map.get_class_variable_pins(ns_here).select{|s| s.name == start}.first
+        return (cv.return_type || api_map.infer_assignment_node_type(cv.node, cv.namespace)) unless cv.nil?
       elsif start.start_with?('@')
         scope = (node.type == :def ? :instance : :class)
-        type = api_map.infer_instance_variable(start, ns_here, scope)
-        return nil if type.nil?
-        return type if remainder.empty?
-        return api_map.infer_signature_type(remainder.join('.'), type, scope: :instance)
+        iv = api_map.get_instance_variable_pins(ns_here, scope).select{|s| s.name == start}.first
+        return (iv.return_type || api_map.infer_assignment_node_type(iv.node, iv.namespace)) unless iv.nil?
       end
       var = find_local_variable_node(start, node)
       if var.nil?
@@ -551,7 +453,7 @@ module Solargraph
 
     def get_type_comment node
       obj = nil
-      cmnt = api_map.get_comment_for(node)
+      cmnt = @source.docstring_for(node)
       unless cmnt.nil?
         tag = cmnt.tag(:type)
         obj = tag.types[0] unless tag.nil? or tag.types.empty?
@@ -570,81 +472,11 @@ module Solargraph
     # @param index [Integer]
     # @return [String]
     def get_signature_at index
-      brackets = 0
-      squares = 0
-      parens = 0
-      signature = ''
-      index -=1
-      while index >= 0
-        unless string_at?(index)
-          break if brackets > 0 or parens > 0 or squares > 0
-          char = @code[index, 1]
-          if char == ')'
-            parens -=1
-          elsif char == ']'
-            squares -=1
-          elsif char == '}'
-            brackets -= 1
-          elsif char == '('
-            parens += 1
-          elsif char == '{'
-            brackets += 1
-          elsif char == '['
-            squares += 1
-            signature = ".[]#{signature}" if squares == 0 and @code[index-2] != '%'
-          end
-          if brackets == 0 and parens == 0 and squares == 0
-            break if ['"', "'", ',', ' ', "\t", "\n", ';', '%'].include?(char)
-            signature = char + signature if char.match(/[a-z0-9:\._@]/i) and @code[index - 1] != '%'
-            if char == '@'
-              signature = "@#{signature}" if @code[index-1, 1] == '@'
-              break
-            end
-          end
-        end
-        index -= 1
-      end
-      signature = signature[1..-1] if signature.start_with?('.')
-      #signature = signature[2..-1] if signature.start_with?('[]')
-      signature
+      get_signature_data_at(index)[1]
     end
 
     def get_signature_index_at index
-      brackets = 0
-      squares = 0
-      parens = 0
-      signature = ''
-      index -=1
-      while index >= 0
-        break if brackets > 0 or parens > 0 or squares > 0
-        char = @code[index, 1]
-        if char == ')'
-          parens -=1
-        elsif char == ']'
-          squares -=1
-        elsif char == '}'
-          brackets -= 1
-        elsif char == '('
-          parens += 1
-        elsif char == '{'
-          brackets += 1
-        elsif char == '['
-          squares += 1
-          signature = ".[]#{signature}" if squares == 0
-        end
-        if brackets == 0 and parens == 0 and squares == 0
-          break if ['"', "'", ',', ' ', "\t", "\n", ';'].include?(char)
-          signature = char + signature if char.match(/[a-z0-9:\._@]/i)
-          if char == '@'
-            signature = "@#{signature}" if @code[index-1, 1] == '@'
-            break
-          end
-        end
-        index -= 1
-      end
-      signature = signature[1..-1] if signature.start_with?('.')
-      signature = signature[2..-1] if signature.start_with?('[]')
-      index + 1
+      get_signature_data_at(index)[0]
     end
 
     def get_snippets_at(index)
@@ -674,7 +506,8 @@ module Solargraph
     def get_local_variables_and_methods_at(index)
       result = []
       local = parent_node_from(index, :class, :module, :def, :defs) || @node
-      result += get_local_variables_from(local)
+      #result += get_local_variables_from(local)
+      result += get_local_variables_from(node_at(index))
       scope = namespace_at(index) || @node
       if local.type == :def
         result += api_map.get_instance_methods(scope, visibility: [:public, :private, :protected])
@@ -685,11 +518,52 @@ module Solargraph
         result += get_method_arguments_from local
       end
       result += get_yieldparams_at(index)
-      result += api_map.get_methods('Kernel')
+      # @todo This might not be necessary.
+      #result += api_map.get_methods('Kernel')
       result
     end
 
     private
+
+    def get_signature_data_at index
+      brackets = 0
+      squares = 0
+      parens = 0
+      signature = ''
+      index -=1
+      while index >= 0
+        unless string_at?(index)
+          break if brackets > 0 or parens > 0 or squares > 0
+          char = @code[index, 1]
+          if char == ')'
+            parens -=1
+          elsif char == ']'
+            squares -=1
+          elsif char == '}'
+            brackets -= 1
+          elsif char == '('
+            parens += 1
+          elsif char == '{'
+            brackets += 1
+          elsif char == '['
+            squares += 1
+            signature = ".[]#{signature}" if squares == 0 and @code[index-2] != '%'
+          end
+          if brackets == 0 and parens == 0 and squares == 0
+            break if ['"', "'", ',', ' ', "\t", "\n", ';', '%'].include?(char)
+            signature = char + signature if char.match(/[a-z0-9:\._@\$]/i) and @code[index - 1] != '%'
+            break if char == '$'
+            if char == '@'
+              signature = "@#{signature}" if @code[index-1, 1] == '@'
+              break
+            end
+          end
+        end
+        index -= 1
+      end
+      signature = signature[1..-1] if signature.start_with?('.')
+      [index + 1, signature]
+    end
 
     # Get a node's arguments as an array of suggestions. The node's type must
     # be a method (:def or :defs).
@@ -761,24 +635,22 @@ module Solargraph
       }
     end
 
+    # Find all the local variables in the node's scope.
+    #
+    # @return [Array<Solargraph::Suggestion>]
     def get_local_variables_from(node)
       node ||= @node
+      namespace = namespace_from(node)
       arr = []
-      node.children.each { |c|
-        if c.kind_of?(AST::Node)
-          if c.type == :lvasgn
-            type = api_map.infer_assignment_node_type(c, namespace_from(c))
-            arr.push Suggestion.new(c.children[0], kind: Suggestion::VARIABLE, documentation: api_map.get_comment_for(c), return_type: type)
-          else
-            arr += get_local_variables_from(c) unless [:class, :module, :def, :defs].include?(c.type)
-          end
-        end
-      }
+      @source.local_variable_pins.select{|p| p.visible_from?(node) }.each do |pin|
+        #arr.push Suggestion.new(pin.name, kind: Suggestion::VARIABLE, return_type: api_map.infer_assignment_node_type(pin.node, namespace))
+        arr.push Suggestion.new(pin.name, kind: Suggestion::VARIABLE)
+      end
       arr
     end
 
     def inner_node_at(index, node, arr)
-      node.children.each { |c|
+      node.children.each do |c|
         if c.kind_of?(AST::Node)
           unless c.loc.expression.nil?
             if index >= c.loc.expression.begin_pos
@@ -793,7 +665,7 @@ module Solargraph
           end
           inner_node_at(index, c, arr)
         end
-      }
+      end
     end
 
     def find_local_variable_node name, scope
@@ -820,9 +692,9 @@ module Solargraph
       while parts.length > 0
         result = api_map.find_fully_qualified_namespace("#{conc}::#{parts[0]}", namespace)
         if result.nil? or result.empty?
-          sugg = api_map.namespaces_in(conc, namespace).select{ |s| s.label == parts[0] }.first
-          return nil if sugg.nil?
-          result = sugg.return_type
+          pin = api_map.get_constant_pins(conc, namespace).select{|s| s.name == parts[0]}.first
+          return nil if pin.nil?
+          result = pin.return_type || api_map.infer_assignment_node_type(pin.node, namespace)
           break if result.nil?
           is_constant = true
           conc = result
@@ -833,17 +705,6 @@ module Solargraph
         end
       end
       return result if is_constant
-      nil
-    end
-
-    def beginning_of_line_from str, i
-      while i > 0 and str[i] != "\n"
-        i -= 1
-      end
-      if i > 0 and str[i..-1].strip == ''
-        i = beginning_of_line_from str, i -1
-      end
-      i
     end
 
     def signature_index_before index
